@@ -63,7 +63,7 @@ log_info "创建临时目录用于克隆代码: $TEMP_CLONE_DIR"
 
 # 从GitHub克隆仓库
 log_info "从GitHub克隆代码..."
-git clone https://github.com/wqh11144/youtube-live.git $TEMP_CLONE_DIR || {
+git clone https://github.com/wqh11144/Youtube_LiveStream.git $TEMP_CLONE_DIR || {
     log_error "克隆GitHub仓库失败"
     rm -rf $TEMP_CLONE_DIR
     exit 1
