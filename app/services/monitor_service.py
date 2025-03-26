@@ -132,124 +132,128 @@ def monitor_all_rtmp_connections():
             
             # 检查每个任务的连接状态和异常情况
             for task_id, info in list(active_processes.items()):
-                # 检查进程是否仍在运行
-                process = info.get('process')
-                if not process or process.poll() is not None:
-                    logger.warning(f'监控发现任务进程已停止 - task_id={task_id}, 返回码={process.poll() if process else "None"}')
-                    continue  # 进程已结束，跳过
+                process = info['process']
+                # 检查进程是否还在运行
+                is_running = process.poll() is None
                 
-                # 检查进程是否僵尸状态（无法响应但仍占用PID）
-                try:
-                    import psutil
+                if not is_running:
+                    # 检查是否在缓冲期中
+                    if info.get('in_buffer_period', False):
+                        logger.info(f'任务 {task_id} 在缓冲期内，暂不处理')
+                        continue
+                        
+                    # 检查进程是否僵尸状态（无法响应但仍占用PID）
                     try:
-                        proc = psutil.Process(process.pid)
-                        proc_status = proc.status()
-                        if proc_status == psutil.STATUS_ZOMBIE:
-                            logger.warning(f'检测到僵尸进程 - task_id={task_id}, pid={process.pid}')
-                            # 先尝试发送SIGTERM信号
-                            proc.terminate()
+                        import psutil
+                        try:
+                            proc = psutil.Process(process.pid)
+                            proc_status = proc.status()
+                            if proc_status == psutil.STATUS_ZOMBIE:
+                                logger.warning(f'检测到僵尸进程 - task_id={task_id}, pid={process.pid}')
+                                # 先尝试发送SIGTERM信号
+                                proc.terminate()
+                                try:
+                                    proc.wait(timeout=5)
+                                except:
+                                    # 如果SIGTERM无效，使用SIGKILL强制结束
+                                    proc.kill()
+                                logger.info(f'已终止僵尸进程 - task_id={task_id}, pid={process.pid}')
+                                
+                                # 更新任务状态
+                                from app.services.task_service import update_task_status
+                                update_task_status(task_id, {
+                                    'status': 'error',
+                                    'message': '任务已自动终止（僵尸进程）',
+                                    'end_time': datetime.now(beijing_tz).isoformat()
+                                })
+                                
+                                # 从活动任务列表中移除
+                                del active_processes[task_id]
+                                continue
+                        except psutil.NoSuchProcess:
+                            logger.warning(f'进程不存在但仍在活动列表中 - task_id={task_id}, pid={process.pid}')
+                            # 从活动任务列表中移除
+                            del active_processes[task_id]
+                            continue
+                    except Exception as e:
+                        logger.error(f'检查进程状态失败 - task_id={task_id}: {str(e)}')
+                    
+                    # 检查卡住的进程 - 如果超过1分钟没有输出，且进程仍在运行，直接终止进程
+                    last_activity = info.get('last_activity_time')
+                    if last_activity:
+                        now = datetime.now(beijing_tz)
+                        inactive_seconds = (now - last_activity).total_seconds()
+                        if inactive_seconds > 60:  # 1分钟无活动
+                            logger.warning(f'任务超过1分钟无活动 - task_id={task_id}, 直接终止进程')
+                            
+                            # 获取任务日志记录器
+                            from app.core.logging import get_task_logger
+                            task_logger = get_task_logger(task_id)
+                            task_logger.warning(f'监控检测到进程超过1分钟无活动，主动终止')
+                            
                             try:
-                                proc.wait(timeout=5)
-                            except:
-                                # 如果SIGTERM无效，使用SIGKILL强制结束
-                                proc.kill()
-                            logger.info(f'已终止僵尸进程 - task_id={task_id}, pid={process.pid}')
+                                # 尝试优雅终止
+                                if platform.system() == 'Windows':
+                                    process.communicate(input=b'q', timeout=3)
+                                else:
+                                    import signal
+                                    os.kill(process.pid, signal.SIGTERM)
+                                
+                                # 等待进程结束
+                                try:
+                                    process.wait(timeout=5)
+                                    logger.info(f'已优雅终止卡住的进程 - task_id={task_id}')
+                                except:
+                                    # 如果优雅终止失败，强制终止
+                                    process.kill()
+                                    logger.warning(f'强制终止卡住的进程 - task_id={task_id}')
+                            except Exception as term_err:
+                                logger.error(f'终止卡住进程失败 - task_id={task_id}: {str(term_err)}')
+                                try:
+                                    # 最后尝试使用psutil强制终止
+                                    psutil.Process(process.pid).kill()
+                                except:
+                                    pass
                             
                             # 更新任务状态
                             from app.services.task_service import update_task_status
                             update_task_status(task_id, {
                                 'status': 'error',
-                                'message': '任务已自动终止（僵尸进程）',
+                                'message': '任务已自动终止（进程卡住超过1分钟无输出）',
                                 'end_time': datetime.now(beijing_tz).isoformat()
                             })
                             
                             # 从活动任务列表中移除
                             del active_processes[task_id]
                             continue
-                    except psutil.NoSuchProcess:
-                        logger.warning(f'进程不存在但仍在活动列表中 - task_id={task_id}, pid={process.pid}')
-                        # 从活动任务列表中移除
-                        del active_processes[task_id]
+                    
+                    # 检查是否正在验证重连或已在缓冲期内
+                    if info.get('verifying_reconnection', False) or info.get('in_buffer_period', False):
+                        continue  # 跳过验证中的任务，避免干扰
+                        
+                    # 如果任务已经在缓冲期内，则跳过网络监控触发的重连
+                    if info.get('in_buffer_period', False):
+                        # 检查缓冲期是否刚开始(不到5秒)
+                        buffer_start = info.get('buffer_period_start')
+                        if buffer_start:
+                            now = datetime.now(beijing_tz)
+                            buffer_seconds = (now - buffer_start).total_seconds()
+                            # 如果缓冲期刚开始不久，完全跳过
+                            if buffer_seconds < 5:
+                                logger.info(f'任务 {task_id} 正在缓冲期初期({buffer_seconds:.1f}秒)，暂不进行网络监控')
+                                continue
+                    
+                    # 按照主机名分组任务
+                    rtmp_url = info.get('rtmp_url', '')
+                    host = extract_host_from_rtmp(rtmp_url)
+                    
+                    if not host:
                         continue
-                except Exception as e:
-                    logger.error(f'检查进程状态失败 - task_id={task_id}: {str(e)}')
-                
-                # 检查卡住的进程 - 如果超过1分钟没有输出，且进程仍在运行，直接终止进程
-                last_activity = info.get('last_activity_time')
-                if last_activity:
-                    now = datetime.now(beijing_tz)
-                    inactive_seconds = (now - last_activity).total_seconds()
-                    if inactive_seconds > 60:  # 1分钟无活动
-                        logger.warning(f'任务超过1分钟无活动 - task_id={task_id}, 直接终止进程')
                         
-                        # 获取任务日志记录器
-                        from app.core.logging import get_task_logger
-                        task_logger = get_task_logger(task_id)
-                        task_logger.warning(f'监控检测到进程超过1分钟无活动，主动终止')
+                    if host not in hosts_to_check:
+                        hosts_to_check[host] = []
                         
-                        try:
-                            # 尝试优雅终止
-                            if platform.system() == 'Windows':
-                                process.communicate(input=b'q', timeout=3)
-                            else:
-                                import signal
-                                os.kill(process.pid, signal.SIGTERM)
-                            
-                            # 等待进程结束
-                            try:
-                                process.wait(timeout=5)
-                                logger.info(f'已优雅终止卡住的进程 - task_id={task_id}')
-                            except:
-                                # 如果优雅终止失败，强制终止
-                                process.kill()
-                                logger.warning(f'强制终止卡住的进程 - task_id={task_id}')
-                        except Exception as term_err:
-                            logger.error(f'终止卡住进程失败 - task_id={task_id}: {str(term_err)}')
-                            try:
-                                # 最后尝试使用psutil强制终止
-                                psutil.Process(process.pid).kill()
-                            except:
-                                pass
-                        
-                        # 更新任务状态
-                        from app.services.task_service import update_task_status
-                        update_task_status(task_id, {
-                            'status': 'error',
-                            'message': '任务已自动终止（进程卡住超过1分钟无输出）',
-                            'end_time': datetime.now(beijing_tz).isoformat()
-                        })
-                        
-                        # 从活动任务列表中移除
-                        del active_processes[task_id]
-                        continue
-                
-                # 检查是否正在验证重连或已在缓冲期内
-                if info.get('verifying_reconnection', False) or info.get('in_buffer_period', False):
-                    continue  # 跳过验证中的任务，避免干扰
-                    
-                # 如果任务已经在缓冲期内，则跳过网络监控触发的重连
-                if info.get('in_buffer_period', False):
-                    # 检查缓冲期是否刚开始(不到5秒)
-                    buffer_start = info.get('buffer_period_start')
-                    if buffer_start:
-                        now = datetime.now(beijing_tz)
-                        buffer_seconds = (now - buffer_start).total_seconds()
-                        # 如果缓冲期刚开始不久，完全跳过
-                        if buffer_seconds < 5:
-                            logger.info(f'任务 {task_id} 正在缓冲期初期({buffer_seconds:.1f}秒)，暂不进行网络监控')
-                            continue
-                
-                # 按照主机名分组任务
-                rtmp_url = info.get('rtmp_url', '')
-                host = extract_host_from_rtmp(rtmp_url)
-                
-                if not host:
-                    continue
-                    
-                if host not in hosts_to_check:
-                    hosts_to_check[host] = []
-                    
-                hosts_to_check[host].append(task_id)
+                    hosts_to_check[host].append(task_id)
         
         # 没有需要检查的主机
         if not hosts_to_check:
