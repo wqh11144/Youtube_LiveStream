@@ -23,7 +23,7 @@ from app.services.monitor_service import ResourceMonitor, monitor_all_rtmp_conne
 from app.services.stream_service import video_executor, active_processes, process_lock
 
 # 全局常量
-APP_VERSION = "1.2.3"
+APP_VERSION = "1.2.3.2"
 
 # 初始化日志记录器
 logger = setup_logging()
