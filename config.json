@@ -1,0 +1,11 @@
+{
+    "video_dir": "public/video",
+    "watermark_path": "public/watermark.png",
+    "auto_stop_minutes": 60,
+    "max_file_size_mb": 250,
+    "watermark_enabled": false,
+    "video_bitrate": "1500k",
+    "audio_bitrate": "128k",
+    "transcode_enabled": false,
+    "log_dir": "data/logs"
+} 

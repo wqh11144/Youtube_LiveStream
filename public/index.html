@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>YouTube 直播控制台</title>
+    <link rel="shortcut icon" href="https://www.youtube.com/s/desktop/ee47b5e0/img/logos/favicon.ico" type="image/x-icon">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/boxicons@2.1.4/css/boxicons.min.css" rel="stylesheet">
+    <link href="static/style.css" rel="stylesheet">
+</head>
+<body class="bg-light">
+    <div class="container py-5">
+        <div class="header text-center mb-5">
+            <h1 class="display-4 mb-2">YouTube 直播控制台 <span class="badge bg-primary fs-6" id="appVersion"></span></h1>
+            <p class="text-muted">简单高效的直播推流管理工具</p>
+        </div>
+        
+        <!-- 视频列表卡片 -->
+        <div class="card mb-4 card-hover">
+            <div class="card-header bg-white">
+                <div class="d-flex align-items-center">
+                    <i class="bx bx-video me-2 text-primary"></i>
+                    <h5 class="card-title mb-0">推流素材</h5>
+                </div>
+            </div>
+            <div class="card-body">
+                <div class="row g-3">
+                    <div class="col-md-8">
+                        <select id="videoSelect" class="form-select form-select-lg">
+                            <option value="">请选择视频文件...</option>
+                        </select>
+                    </div>
+                    <div class="col-md-4 d-flex gap-2">
+                        <button class="btn btn-outline-primary flex-grow-1 d-flex align-items-center justify-content-center" onclick="refreshVideoList()">
+                            <i class="bx bx-refresh me-1"></i>拉取视频
+                        </button>
+                        <label class="btn btn-primary flex-grow-1 d-flex align-items-center justify-content-center" for="videoUpload">
+                            <i class="bx bx-upload me-1"></i>上传
+                            <input type="file" id="videoUpload" accept="video/mp4,video/quicktime,video/x-msvideo,video/x-flv,.mp4,.mov,.avi,.flv" style="display: none;" onchange="uploadVideo(this)">
+                        </label>
+                        <button class="btn btn-danger flex-grow-1 d-flex align-items-center justify-content-center" onclick="clearVideos()">
+                            <i class="bx bx-trash me-1"></i>清空
+                        </button>
+                    </div>
+                </div>
+
+                <div class="form-text" id="uploadSizeLimit">只支持视频编码: h264；支持的视频格式：mp4, flv</div>
+
+                <!-- 文件上传进度条 -->
+                <div id="uploadProgressContainer" class="mt-3" style="display: none;">
+                    <div class="progress">
+                        <div id="uploadProgress" class="progress-bar" role="progressbar" style="width: 0%" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100">0%</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 推流设置卡片 -->
+        <div class="card mb-4 card-hover">
+            <div class="card-header bg-white">
+                <div class="d-flex align-items-center">
+                    <i class="bx bx-cog me-2 text-primary"></i>
+                    <h5 class="card-title mb-0">推流配置</h5>
+                </div>
+            </div>
+            <div class="card-body">
+                <form id="streamForm">
+                    <div class="row g-3">
+                        <!-- 任务描述和RTMP地址水平布局 -->
+                        <div class="col-md-6">
+                            <div class="form-floating">
+                                <input type="text" class="form-control" id="rtmpUrl" required>
+                                <label for="rtmpUrl">RTMP 地址</label>
+                            </div>
+                            <div class="form-text">可直接输入直播码，系统将自动识别补齐</div>
+                        </div>
+                        
+                        <div class="col-md-6">
+                            <div class="form-floating">
+                                <input type="number" class="form-control" id="autoStopMinutes" value="699" min="1" max="1440">
+                                <label for="autoStopMinutes">持续时间（分钟）</label>
+                            </div>
+                        </div>
+                        
+                        <div class="col-md-6">
+                            <div class="form-floating">
+                                <input type="text" class="form-control" id="taskName" placeholder=" " maxlength="25">
+                                <label for="taskName">任务描述</label>
+                            </div>
+                            <div class="form-text">可选，用于描述本次任务，支持中文（最多25个字符）</div>
+                        </div>
+                        <div class="col-md-6">
+                            <div class="form-floating">
+                                <input type="text" class="form-control" id="socks5Proxy" placeholder=" ">
+                                <label for="socks5Proxy">SOCKS5 代理设置</label>
+                            </div>
+                            <div class="form-text">格式：ip:port 或 ip:port:username:password（用户名密码可选）</div>
+                        </div>
+
+                        <div class="col-md-6">
+                            <div class="form-floating">
+                                <input type="datetime-local" class="form-control" id="scheduledStartTime">
+                                <label for="scheduledStartTime">计划开始时间</label>
+                            </div>
+                            <div class="form-text">为空则立即开始，设置后将在指定时间自动开始</div>
+                        </div>
+
+                        <div class="col-12">
+                            <div class="form-check form-switch">
+                                <input class="form-check-input" type="checkbox" id="transcodeEnabled">
+                                <label class="form-check-label" for="transcodeEnabled">启用转码</label>
+                            </div>
+                        </div>
+
+                        <div class="col-12">
+                            <button type="submit" class="btn btn-primary btn-lg w-100 d-flex align-items-center justify-content-center">
+                                <i class="bx bx-task me-2"></i>创建任务
+                            </button>
+                        </div>
+                    </div>
+                </form>
+            </div>
+        </div>
+ 
+<!-- 任务状态卡片 -->
+<div class="card card-hover">
+    <div class="card-header bg-white">
+        <div class="d-flex justify-content-between align-items-center">
+            <div class="d-flex align-items-center">
+                <i class="bx bx-list-ul me-2 text-primary"></i>
+                <h5 class="card-title mb-0">任务状态</h5>
+            </div>
+            <div class="d-flex align-items-center gap-2">
+                <div class="d-flex align-items-center">
+                    <label for="taskLimit" class="form-label mb-0 me-2">显示数量:</label>
+                    <input type="number" class="form-control form-control-sm" id="taskLimit" value="10" min="1" max="99" style="width: 70px;" onchange="if(this.value>99)this.value=99;if(this.value<1)this.value=1;">
+                </div>
+                <button class="btn btn-sm btn-outline-primary d-flex align-items-center" onclick="refreshTaskStatus()">
+                    <i class="bx bx-refresh me-1"></i>刷新状态
+                </button>
+            </div>
+        </div>
+    </div>
+    <div class="card-body">
+        <div class="table-responsive">
+            <table class="table table-hover" id="taskTable">
+                <thead>
+                    <tr>
+                        <th>序号</th>
+                        <th>直播码</th>
+                        <th>任务状态</th>
+                        <th>计划时间</th>
+                        <th>结束时间</th>
+                        <th>描述</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody id="taskList">
+                    <!-- 任务列表将通过JavaScript动态填充 -->
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+
+
+
+    </div>
+
+    <!-- 提示框 -->
+    <div class="toast-container position-fixed bottom-0 end-0 p-3">
+        <div id="toast" class="toast" role="alert" aria-live="assertive" aria-atomic="true">
+            <div class="toast-header">
+                <i class="bx bx-info-circle me-2"></i>
+                <strong class="me-auto" id="toastTitle">系统提示</strong>
+                <button type="button" class="btn-close" data-bs-dismiss="toast" aria-label="Close"></button>
+            </div>
+            <div class="toast-body" id="toastMessage"></div>
+        </div>
+    </div>
+
+    <!-- 确认弹窗 -->
+    <div class="modal fade" id="confirmModal" tabindex="-1" aria-labelledby="confirmModalLabel" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="confirmModalLabel">确认推流设置</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="settings-summary">
+                        <div class="mb-3">
+                            <strong>视频文件：</strong>
+                            <span id="confirmVideo" class="text-primary"></span>
+                        </div>
+                        <div class="mb-3">
+                            <strong>RTMP 地址：</strong>
+                            <span id="confirmRtmp" class="text-primary"></span>
+                        </div>
+                        <div class="mb-3">
+                            <strong>任务描述：</strong>
+                            <span id="confirmTaskName" class="text-primary"></span>
+                        </div>
+                        <div class="mb-3">
+                            <strong>持续时间：</strong>
+                            <span id="confirmTime" class="text-primary"></span>
+                        </div>
+                        <div class="mb-3">
+                            <strong>转码设置：</strong>
+                            <span id="confirmTranscode" class="text-primary"></span>
+                        </div>
+                        <div class="mb-3">
+                            <strong>代理设置：</strong>
+                            <span id="confirmProxy" class="text-primary"></span>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+                    <button type="button" class="btn btn-primary" id="confirmStartStream">
+                        <i class="bx bx-play-circle me-1"></i>确认开始
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 任务详情弹窗 -->
+    <div class="modal fade" id="taskDetailModal" tabindex="-1" aria-labelledby="taskDetailModalLabel" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered modal-lg">
+            <div class="modal-content">
+                <div class="modal-header py-3">
+                    <h5 class="modal-title" id="taskDetailModalLabel">任务详情</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body p-0">
+                    <div class="task-detail-content" style="max-height: 65vh; overflow-y: auto;">
+                        <!-- 基本信息 -->
+                        <div class="card mb-3">
+                            <div class="card-header bg-light py-2">
+                                <h6 class="mb-0"><i class="bx bx-info-circle me-2"></i>基本信息</h6>
+                            </div>
+                            <div class="card-body py-3">
+                                <div class="row g-3">
+                                    <div class="col-md-6">
+                                        <div class="d-flex mb-2">
+                                            <small class="text-muted me-3" style="width: 90px; flex-shrink: 0;">任务状态：</small>
+                                            <div id="detailStatus" class="flex-grow-1" style="word-break: break-word;"></div>
+                                        </div>
+                                        <div class="d-flex mb-2">
+                                            <small class="text-muted me-3" style="width: 90px; flex-shrink: 0;">任务序号：</small>
+                                            <div id="detailTaskId" class="text-primary flex-grow-1" style="word-break: break-word;"></div>
+                                        </div>
+                                        <div class="d-flex mb-2">
+                                            <small class="text-muted me-3" style="width: 90px; flex-shrink: 0;">任务描述：</small>
+                                            <div id="detailTaskName" class="text-primary flex-grow-1" style="word-break: break-word;"></div>
+                                        </div>
+                                    </div>
+                                    <div class="col-md-6">
+                                        <!-- <div class="d-flex mb-2">
+                                            <small class="text-muted me-3" style="width: 90px; flex-shrink: 0;">开始时间</small>
+                                            <div id="detailStartTime" class="text-primary flex-grow-1" style="word-break: break-word;"></div>
+                                        </div> -->
+                                        <div class="d-flex mb-2">
+                                            <small class="text-muted me-3" style="width: 90px; flex-shrink: 0;">创建时间：</small>
+                                            <div id="detailCreateTime" class="text-primary flex-grow-1" style="word-break: break-word;"></div>
+                                        </div>
+                                        <div class="d-flex mb-2">
+                                            <small class="text-muted me-3" style="width: 90px; flex-shrink: 0;">计划时间：</small>
+                                            <div id="detailScheduledTime" class="text-primary flex-grow-1" style="word-break: break-word;"></div>
+                                        </div>
+
+                                        <div class="d-flex mb-2">
+                                            <small class="text-muted me-3" style="width: 90px; flex-shrink: 0;">结束时间：</small>
+                                            <div id="detailEndTime" class="text-primary flex-grow-1" style="word-break: break-word;"></div>
+                                        </div>
+
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- 推流设置 -->
+                        <div class="card mb-3">
+                            <div class="card-header bg-light py-2">
+                                <h6 class="mb-0"><i class="bx bx-cog me-2"></i>推流设置</h6>
+                            </div>
+                            <div class="card-body py-3">
+                                <div class="row g-3">
+                                    <div class="col-md-6">
+                                        <div class="d-flex mb-2">
+                                            <small class="text-muted me-3" style="width: 90px; flex-shrink: 0;">RTMP地址：</small>
+                                            <div id="detailRtmpUrl" class="text-primary flex-grow-1" style="word-break: break-word;"></div>
+                                        </div>
+                                        <div class="d-flex mb-2">
+                                            <small class="text-muted me-3" style="width: 90px; flex-shrink: 0;">视频文件：</small>
+                                            <div id="detailVideoFile" class="text-primary flex-grow-1" style="word-break: break-word;"></div>
+                                        </div>
+                                    </div>
+                                    <div class="col-md-6">
+                                        <div class="d-flex mb-2">
+                                            <small class="text-muted me-3" style="width: 90px; flex-shrink: 0;">持续时间：</small>
+                                            <div id="detailAutoStop" class="text-primary flex-grow-1" style="word-break: break-word;"></div>
+                                        </div>
+                                        <div class="d-flex mb-2">
+                                            <small class="text-muted me-3" style="width: 90px; flex-shrink: 0;">转码设置：</small>
+                                            <div id="detailTranscode" class="text-primary flex-grow-1" style="word-break: break-word;"></div>
+                                        </div>
+                                        <div class="d-flex mb-2">
+                                            <small class="text-muted me-3" style="width: 90px; flex-shrink: 0;">代理设置：</small>
+                                            <div id="detailProxy" class="text-primary flex-grow-1" style="word-break: break-word;"></div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- 运行信息 -->
+                        <div class="card mb-3">
+                            <div class="card-header bg-light py-2">
+                                <h6 class="mb-0"><i class="bx bx-time me-2"></i>运行信息</h6>
+                            </div>
+                            <div class="card-body py-3">
+                                <div class="row g-3">
+                                    <div class="col-md-6">
+                                        <div class="d-flex mb-2">
+                                            <small class="text-muted me-3" style="width: 90px; flex-shrink: 0;">运行时长：</small>
+                                            <div id="detailRuntime" class="text-primary flex-grow-1" style="word-break: break-word;"></div>
+                                        </div>
+                                        
+                                        <div class="d-flex mb-2">
+                                            <small class="text-muted me-3" style="width: 90px; flex-shrink: 0;">运行情况：</small>
+                                            <div id="detailMessage" class="text-primary flex-grow-1" style="word-break: break-word;"></div>
+                                        </div>
+                                    </div>
+                                    <div class="col-md-6">
+                                        <!-- 添加错误详细信息字段 -->
+                                        <div class="d-flex mb-2">
+                                            <small class="text-muted me-3" style="width: 90px; flex-shrink: 0;">详细内容：</small>
+                                            <div id="detailErrorMessage" class="text-danger flex-grow-1" style="word-break: break-word; white-space: pre-line; font-family: monospace; font-size: 0.85rem;"></div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer py-3">
+                    <button type="button" class="btn btn-outline-primary" onclick="reusePreviousSettings()">
+                        <i class="bx bx-revision me-1"></i> 使用相同设置重新开播
+                    </button>
+                    <button type="button" class="btn btn-outline-primary" onclick="editAndRestart()">
+                        <i class="bx bx-edit me-1"></i> 编辑设置后重新开播
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 加载中弹窗 -->
+    <div class="modal fade" id="loadingModal" data-bs-backdrop="static" data-bs-keyboard="false" tabindex="-1" aria-labelledby="loadingModalLabel" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered modal-sm">
+            <div class="modal-content bg-white">
+                <div class="modal-header py-2 border-0">
+                    <button type="button" class="btn-close" onclick="forceCloseLoadingModal()" aria-label="Close"></button>
+                </div>
+                <div class="modal-body text-center py-4">
+                    <div class="spinner-border text-primary mb-3" role="status" style="width: 3rem; height: 3rem;">
+                        <span class="visually-hidden">加载中...</span>
+                    </div>
+                    <h5 class="mb-0" id="loadingText">任务创建中，请稍候...</h5>
+                    <p class="text-muted mt-2 mb-0 small" id="loadingSubtext">正在与服务器通信</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="static/script.js"></script> 
+
+    <script>
+        // 强制关闭加载中弹窗的函数
+        function forceCloseLoadingModal() {
+            console.log('用户强制关闭加载弹窗');
+            
+            // 获取弹窗元素
+            const modalElement = document.getElementById('loadingModal');
+            
+            // 移除modal相关类
+            if (modalElement) {
+                modalElement.classList.remove('show', 'modal-open', 'fade');
+                modalElement.style.display = 'none';
+                modalElement.setAttribute('aria-hidden', 'true');
+                modalElement.removeAttribute('aria-modal');
+                modalElement.removeAttribute('role');
+            }
+            
+            // 移除所有backdrop
+            const backdrops = document.querySelectorAll('.modal-backdrop');
+            backdrops.forEach(backdrop => {
+                backdrop.parentNode.removeChild(backdrop);
+            });
+            
+            // 恢复body样式
+            document.body.classList.remove('modal-open');
+            document.body.style.removeProperty('overflow');
+            document.body.style.removeProperty('padding-right');
+            
+            // 提示用户
+            const toastEl = document.getElementById('toast');
+            const toastTitle = document.getElementById('toastTitle');
+            const toastMessage = document.getElementById('toastMessage');
+            
+            if (toastEl && toastTitle && toastMessage) {
+                toastTitle.textContent = '提示';
+                toastMessage.textContent = '已强制关闭加载窗口，但后台任务可能仍在执行中';
+                
+                // 使用Bootstrap实例或创建新实例
+                if (typeof bootstrap !== 'undefined') {
+                    const toast = new bootstrap.Toast(toastEl);
+                    toast.show();
+                }
+            }
+        }
+    </script>
+
+</body>
+</html> 
