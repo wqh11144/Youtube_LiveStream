@@ -184,28 +184,43 @@ class FFmpegLogFilter(logging.Filter):
         return True
 
 def get_task_logger(task_id):
-    """获取任务专用日志记录器"""
-    task_log_file = LOGS_DIR / f'ffmpeg_task_{task_id}.log'
-    task_logger = logging.getLogger(f'task_{task_id}')
-    task_logger.setLevel(logging.DEBUG)
+    """获取特定任务的日志记录器"""
+    logger_name = f'task_{task_id}'
+    logger = logging.getLogger(logger_name)
     
-    # 清理已有的处理器
-    if task_logger.handlers:
-        for handler in task_logger.handlers:
-            task_logger.removeHandler(handler)
+    # 检查是否已经配置了处理器
+    if not logger.handlers:
+        # 获取应用根目录的绝对路径
+        app_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+        
+        # 使用绝对路径创建日志目录
+        log_dir = os.path.join(app_root, 'logs', 'tasks')
+        os.makedirs(log_dir, exist_ok=True)
+        
+        # 创建日志文件路径
+        log_file = os.path.join(log_dir, f"{task_id}.log")
+        
+        try:
+            # 尝试创建文件处理器
+            file_handler = logging.FileHandler(log_file)
+            
+            # 设置格式器
+            formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', 
+                                          datefmt='%Y-%m-%d %H:%M:%S')
+            file_handler.setFormatter(formatter)
+            
+            # 添加处理器并设置日志级别
+            logger.addHandler(file_handler)
+            logger.setLevel(logging.INFO)
+            
+            # 记录日志系统初始化成功
+            logger.info(f"任务日志初始化成功 - 日志文件: {log_file}")
+        except Exception as e:
+            # 记录日志初始化失败
+            sys_logger = logging.getLogger('youtube_live')
+            sys_logger.error(f"无法为任务 {task_id} 创建日志文件: {str(e)}")
     
-    # 添加文件处理器
-    file_handler = logging.FileHandler(task_log_file, encoding='utf-8')
-    # 使用简化的日志格式，减少冗余，并使用北京时区
-    file_handler.setFormatter(BeijingTimeFormatter('[%(asctime)s] %(levelname)-8s: %(message)s'))
-    
-    # 添加日志过滤器
-    ffmpeg_filter = FFmpegLogFilter()
-    file_handler.addFilter(ffmpeg_filter)
-    
-    task_logger.addHandler(file_handler)
-    
-    return task_logger
+    return logger
 
 def get_task_log_path(task_id):
     """获取任务日志文件路径"""

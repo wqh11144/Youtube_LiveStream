@@ -15,6 +15,7 @@ import uuid
 import datetime
 import asyncio
 import psutil
+import os
 
 from app.api import api_router
 from app.core.logging import setup_logging, cleanup_old_logs, get_task_log_path
@@ -475,11 +476,42 @@ async def shutdown_event():
     else:
         logger.info("监控服务未在运行中")
 
+def verify_logging_system():
+    """验证日志系统路径和权限"""
+    try:
+        # 获取应用根目录
+        app_root = os.path.abspath(os.path.dirname(__file__))
+        log_root = os.path.join(app_root, '..', 'logs')
+        
+        # 确保主日志目录存在
+        os.makedirs(log_root, exist_ok=True)
+        
+        # 确保任务日志目录存在
+        tasks_log_dir = os.path.join(log_root, 'tasks')
+        os.makedirs(tasks_log_dir, exist_ok=True)
+        
+        # 测试写入权限
+        test_file = os.path.join(tasks_log_dir, 'test_write.log')
+        with open(test_file, 'w') as f:
+            f.write('Logging system check: OK\n')
+        
+        # 清理测试文件
+        os.remove(test_file)
+        
+        print(f"日志系统验证成功 - 路径: {log_root}")
+        return True
+    except Exception as e:
+        print(f"日志系统验证失败: {str(e)}")
+        return False
+
 # 主入口点
 if __name__ == '__main__':
     logger.info('启动应用程序')
     
     try:
+        # 验证日志系统
+        verify_logging_system()
+        
         # 启动FastAPI应用
         uvicorn.run(
             app,
