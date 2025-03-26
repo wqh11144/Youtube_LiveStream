@@ -17,7 +17,7 @@ from threading import Lock
 
 from app.utils.file_utils import create_proxy_config, cleanup_proxy_config
 from app.utils.video_utils import get_ffmpeg_command, check_video_codec, reconnect_keywords, ffmpeg_filter_patterns
-from app.utils.network_utils import rtmp_error_strategies, test_rtmp_connection, validate_rtmp_url
+from app.utils.network_utils import rtmp_error_strategies, test_rtmp_connection, validate_rtmp_url, extract_host_from_rtmp
 from app.services.task_service import update_task_status
 from app.core.logging import get_task_logger
 
@@ -31,6 +31,21 @@ video_executor = ThreadPoolExecutor(max_workers=10)
 # 活动任务存储
 active_processes = {}
 process_lock = Lock()  # 线程锁
+
+# 配置化的网络参数
+NETWORK_BUFFER_TIME = 10  # 默认缓冲期时间（秒）
+NETWORK_MAX_BUFFER_TIME = 15  # 最大缓冲期时间（秒）
+
+# 需要立即重连的严重错误关键词
+immediate_reconnect_keywords = [
+    'connection refused',
+    'host not found',
+    'no route to host',
+    'server returned 403',
+    'server returned 401',
+    'access denied',
+    'permission denied'
+]
 
 # 用于检测需要重连的网络相关错误关键词
 reconnect_keywords = [
@@ -56,7 +71,6 @@ reconnect_keywords = [
     'connection closed',
     'disconnected',
     'tcp timeout',
-    'host not found',
     'resolve failed',
     'network down',
     'network changed',
@@ -144,6 +158,9 @@ def read_output(process, task_id):
         
         # 标记是否发现需要重连的错误
         need_reconnect = False
+        # 记录发现网络问题的时间
+        network_issue_time = None
+        network_issue_description = None
         
         # 关键调试信息关键词 - 这些总是要记录的
         important_keywords = ['rtmp', 'connect', 'error', 'fail', 'warning', 'unable', 'cannot', 'missing', 'invalid']
@@ -193,11 +210,90 @@ def read_output(process, task_id):
                 # 检查是否是重连相关的错误
                 for pattern in reconnect_patterns:
                     if pattern.lower() in line.lower():
-                        logger.warning(f'{log_prefix} 检测到网络异常，需要外部重连: {line}')
-                        task_logger.warning(f'检测到网络异常，需要外部重连: {line}')
-                        # 标记需要重连
-                        need_reconnect = True
+                        # 检查是否是需要立即重连的严重错误
+                        if any(keyword in line.lower() for keyword in immediate_reconnect_keywords):
+                            logger.warning(f'{log_prefix} 检测到严重错误，将跳过缓冲期直接重连: {line}')
+                            task_logger.warning(f'检测到严重错误，将跳过缓冲期直接重连: {line}')
+                            need_reconnect = True
+                            # 记录问题描述以便记录统计
+                            network_issue_description = get_error_description(line)
+                            break
+
+                        logger.warning(f'{log_prefix} 检测到网络异常，进入缓冲期监控: {line}')
+                        task_logger.warning(f'检测到网络异常，进入缓冲期监控: {line}')
+                        
+                        # 记录问题描述
+                        if network_issue_description is None:
+                            network_issue_description = get_error_description(line)
+                        
+                        # 如果是首次检测到网络问题，记录时间
+                        if network_issue_time is None:
+                            network_issue_time = datetime.now(beijing_tz)
+                            # 通知其他监控组件缓冲期已开始
+                            with process_lock:
+                                if task_id in active_processes:
+                                    active_processes[task_id]['in_buffer_period'] = True
+                                    active_processes[task_id]['buffer_period_start'] = network_issue_time
+                                    active_processes[task_id]['network_issue_description'] = network_issue_description
+                        else:
+                            # 已经在缓冲期内，检查是否超过最大缓冲时间
+                            buffer_seconds = (datetime.now(beijing_tz) - network_issue_time).total_seconds()
+                            if buffer_seconds > NETWORK_BUFFER_TIME:
+                                # 超过缓冲期，问题仍存在，标记需要重连
+                                logger.warning(f'{log_prefix} 网络问题持续超过{NETWORK_BUFFER_TIME}秒，将执行重连')
+                                task_logger.warning(f'网络问题持续超过{NETWORK_BUFFER_TIME}秒，将执行重连')
+                                need_reconnect = True
+                                # 重置问题时间，避免重复触发
+                                network_issue_time = None
+                                
+                                # 添加统计
+                                with process_lock:
+                                    if task_id in active_processes:
+                                        active_processes[task_id]['reconnect_reason'] = f"网络问题持续超过{NETWORK_BUFFER_TIME}秒: {network_issue_description}"
+                                        active_processes[task_id]['buffer_timeout_count'] = active_processes[task_id].get('buffer_timeout_count', 0) + 1
+                            else:
+                                # 在缓冲期内，继续观察
+                                task_logger.info(f'网络问题仍在缓冲期内 ({buffer_seconds:.1f}秒/{NETWORK_BUFFER_TIME}秒)')
                         break
+        
+        # 如果检测到正常的流媒体输出，可能表示问题已恢复
+        if network_issue_time and is_network_recovered(line):
+            # 检查是否在缓冲期内有正常输出
+            buffer_seconds = (datetime.now(beijing_tz) - network_issue_time).total_seconds()
+            logger.info(f'{log_prefix} 在缓冲期内({buffer_seconds:.1f}秒)检测到正常输出，网络已恢复')
+            task_logger.info(f'在缓冲期内({buffer_seconds:.1f}秒)检测到正常输出，网络已恢复')
+            
+            # 统计缓冲期成功情况
+            with process_lock:
+                if task_id in active_processes:
+                    active_processes[task_id]['in_buffer_period'] = False
+                    # 记录恢复时间以便后续分析
+                    if 'recovery_times' not in active_processes[task_id]:
+                        active_processes[task_id]['recovery_times'] = []
+                    active_processes[task_id]['recovery_times'].append(buffer_seconds)
+                    # 增加成功计数
+                    count_key = 'buffer_success_count'
+                    active_processes[task_id][count_key] = active_processes[task_id].get(count_key, 0) + 1
+                    logger.info(f'任务 {task_id} 缓冲期成功避免了不必要的重连，累计: {active_processes[task_id][count_key]}次')
+            
+            network_issue_time = None  # 重置问题时间
+            network_issue_description = None
+        
+        # 缓冲期防卡保护: 确保缓冲期不会无限期等待
+        if network_issue_time:
+            current_buffer_time = (datetime.now(beijing_tz) - network_issue_time).total_seconds()
+            if current_buffer_time > NETWORK_MAX_BUFFER_TIME:
+                logger.warning(f'{log_prefix} 缓冲期超过最大等待时间 {NETWORK_MAX_BUFFER_TIME}秒，强制结束缓冲')
+                task_logger.warning(f'缓冲期超过最大等待时间 {NETWORK_MAX_BUFFER_TIME}秒，强制结束缓冲')
+                need_reconnect = True
+                network_issue_time = None
+        
+        # 缓冲期内进程状态监控: 检查进程是否在缓冲期内退出
+        if network_issue_time and process.poll() is not None:
+            logger.warning(f'{log_prefix} 缓冲期内进程已退出，将直接执行重连')
+            task_logger.warning(f'缓冲期内进程已退出，将直接执行重连')
+            need_reconnect = True
+            network_issue_time = None
         
         # 进程结束后，检查返回值
         returncode = process.wait()
@@ -955,6 +1051,55 @@ async def start_stream(task_id: str, video_path: str, rtmp_url: str, proxy_confi
             "error_details": error_details
         } 
 
+def safe_trigger_reconnect(task_id, reason):
+    """
+    安全地触发重连，防止并发重连
+    
+    Args:
+        task_id: 任务ID
+        reason: 重连原因
+        
+    Returns:
+        bool: 是否成功触发重连
+    """
+    logger.info(f'尝试安全触发任务 {task_id} 重连，原因: {reason}')
+    
+    with process_lock:
+        if task_id not in active_processes:
+            logger.warning(f'任务 {task_id} 不在活动列表中，无法重连')
+            return False
+            
+        # 检查是否已经在重连中
+        if active_processes[task_id].get('reconnecting'):
+            logger.info(f'任务 {task_id} 已在重连过程中，忽略新的重连请求')
+            return False
+            
+        # 检查是否在验证中
+        if active_processes[task_id].get('verifying_reconnection'):
+            logger.info(f'任务 {task_id} 正在验证重连状态，忽略新的重连请求')
+            return False
+            
+        # 检查上次重连时间，避免频繁重连
+        last_reconnect_time = active_processes[task_id].get('last_reconnect_time')
+        if last_reconnect_time:
+            now = datetime.now(beijing_tz)
+            seconds_since_last_reconnect = (now - last_reconnect_time).total_seconds()
+            if seconds_since_last_reconnect < 30:
+                logger.warning(f'距离上次重连仅 {seconds_since_last_reconnect:.1f} 秒，忽略本次重连请求')
+                return False
+                
+        # 标记为重连中
+        active_processes[task_id]['reconnecting'] = True
+        active_processes[task_id]['reconnect_initiated_by'] = 'safe_trigger_func'
+        active_processes[task_id]['reconnect_reason'] = reason
+        
+        # 重置缓冲期状态
+        active_processes[task_id]['in_buffer_period'] = False
+        active_processes[task_id]['network_issue_start_time'] = None
+    
+    # 实际触发重连
+    return trigger_reconnect(task_id, reason)
+
 def trigger_task_reconnect(task_id: str, reason: str = "外部触发重连") -> bool:
     """
     主动触发任务重连
@@ -1091,31 +1236,104 @@ def _execute_reconnect(task_id, reconnect_function, total_reconnects):
                 return
                 
             if new_process:
-                # 重连成功
-                task_logger.info("重连成功，更新任务状态")
+                # 重连成功，但需要验证
+                task_logger.info("重连初步成功，开始验证重连状态")
                 
-                # 更新进程信息
+                # 更新进程信息，标记为验证中
                 active_processes[task_id]['process'] = new_process
-                active_processes[task_id]['restart_count'] = 1  # 重置为1
-                active_processes[task_id]['total_reconnects'] = updated_total_reconnects
-                active_processes[task_id]['last_reconnect_time'] = datetime.now(beijing_tz)
-                active_processes[task_id]['network_status'] = '已重连'
-                active_processes[task_id]['reconnecting'] = False
-                active_processes[task_id]['need_reconnect'] = False
-                active_processes[task_id]['last_activity_time'] = datetime.now(beijing_tz)  # 重置活动时间
-                # 重置重试相关计数
-                active_processes[task_id]['retry_count'] = 0
+                active_processes[task_id]['verifying_reconnection'] = True
+                active_processes[task_id]['last_activity_time'] = datetime.now(beijing_tz)
                 
-                # 更新任务状态
-                update_task_status(task_id, {
-                    "status": "running",
-                    "message": f"任务已通过主动重连机制恢复",
-                    "restart_count": 1,
-                    "total_reconnects": updated_total_reconnects
-                })
-                
-                # 启动新的输出读取线程
+                # 启动输出读取线程（确保能捕获输出）
                 video_executor.submit(read_output, new_process, task_id)
+                
+                # 给输出读取线程一点时间启动
+                time.sleep(2)
+                
+                # 验证重连状态
+                verification_result = verify_reconnection_status(task_id, new_process)
+                
+                # 根据验证结果更新状态
+                with process_lock:
+                    if task_id not in active_processes:
+                        return
+                        
+                    if verification_result:
+                        # 重连验证成功
+                        task_logger.info("重连验证成功，更新任务状态")
+                        
+                        # 更新进程信息
+                        active_processes[task_id]['restart_count'] = 1  # 重置为1
+                        active_processes[task_id]['total_reconnects'] = updated_total_reconnects
+                        active_processes[task_id]['last_reconnect_time'] = datetime.now(beijing_tz)
+                        active_processes[task_id]['network_status'] = '已重连并验证'
+                        active_processes[task_id]['reconnecting'] = False
+                        active_processes[task_id]['need_reconnect'] = False
+                        active_processes[task_id]['verifying_reconnection'] = False
+                        # 重置网络相关状态
+                        reset_task_network_status(task_id)
+                        # 重置重试相关计数
+                        active_processes[task_id]['retry_count'] = 0
+                        
+                        # 更新任务状态
+                        update_task_status(task_id, {
+                            "status": "running",
+                            "message": f"任务已通过主动重连机制恢复并验证",
+                            "restart_count": 1,
+                            "total_reconnects": updated_total_reconnects
+                        })
+                    else:
+                        # 重连验证失败，再次尝试重连或终止
+                        task_logger.error("重连验证失败，任务状态不稳定")
+                        
+                        # 检查是否应该再次尝试重连
+                        retry_count = active_processes[task_id].get('reconnect_verify_retries', 0)
+                        if retry_count < 2:  # 最多尝试2次验证
+                            # 增加重试计数
+                            active_processes[task_id]['reconnect_verify_retries'] = retry_count + 1
+                            task_logger.warning(f"重连验证失败，将再次尝试重连 (尝试 {retry_count + 1}/2)")
+                            
+                            # 终止当前进程
+                            try:
+                                if new_process and new_process.poll() is None:
+                                    new_process.terminate()
+                                    try:
+                                        new_process.wait(timeout=5)
+                                    except:
+                                        new_process.kill()
+                            except:
+                                pass
+                            
+                            # 延迟5秒后再次尝试重连
+                            time.sleep(5)
+                            _execute_reconnect(task_id, reconnect_function, updated_total_reconnects)
+                            return
+                        else:
+                            # 重连验证多次失败，终止任务
+                            task_logger.error("重连验证多次失败，任务终止")
+                            
+                            # 更新任务状态
+                            update_task_status(task_id, {
+                                "status": "error",
+                                "message": "主动重连失败：验证未通过",
+                                "error_message": "任务重连后状态不稳定，多次验证失败",
+                                "end_time": datetime.now(beijing_tz).isoformat()
+                            })
+                            
+                            # 终止当前进程
+                            try:
+                                if new_process and new_process.poll() is None:
+                                    new_process.terminate()
+                                    try:
+                                        new_process.wait(timeout=5)
+                                    except:
+                                        new_process.kill()
+                            except:
+                                pass
+                            
+                            # 从活动任务列表中移除
+                            if task_id in active_processes:
+                                del active_processes[task_id]
             else:
                 # 重连失败
                 task_logger.error("重连失败，任务终止")
@@ -1156,10 +1374,304 @@ def _execute_reconnect(task_id, reconnect_function, total_reconnects):
             with process_lock:
                 if task_id in active_processes:
                     active_processes[task_id]['reconnecting'] = False
+                    active_processes[task_id]['verifying_reconnection'] = False
                     # 如果没有活动进程，则从列表中移除
                     if not active_processes[task_id].get('process') or active_processes[task_id]['process'].poll() is not None:
                         del active_processes[task_id]
         except Exception as inner_e:
             logger.error(f"处理重连错误时又发生错误 - task_id={task_id}: {str(inner_e)}")
+
+def verify_reconnection_status(task_id, new_process, verification_time=20):
+    """
+    验证重连后的任务是否真正恢复正常
+    
+    Args:
+        task_id: 任务ID
+        new_process: 新创建的进程
+        verification_time: 验证时间（秒）
+        
+    Returns:
+        bool: 是否验证通过
+    """
+    logger.info(f"开始验证重连状态 - task_id={task_id}, 验证时间={verification_time}秒")
+    task_logger = get_task_logger(task_id)
+    task_logger.info(f"开始验证重连状态, 验证时间={verification_time}秒")
+    
+    # 初始化验证状态
+    verification_results = {
+        'process_alive': False,     # 进程存活
+        'has_output': False,        # 有输出产生
+        'network_stable': False,    # 网络稳定
+        'no_critical_errors': True  # 无严重错误
+    }
+    
+    # 记录开始时间
+    start_time = datetime.now(beijing_tz)
+    end_time = start_time + timedelta(seconds=verification_time)
+    
+    # 初始化错误计数器
+    error_count = 0
+    critical_errors = []
+    
+    # 输出采集器（用于捕获这段时间的输出）
+    captured_output = []
+    
+    # 监控循环
+    while datetime.now(beijing_tz) < end_time:
+        # 1. 检查进程是否仍在运行
+        if new_process.poll() is not None:
+            exitcode = new_process.poll()
+            task_logger.error(f"验证失败: 进程已退出, 退出码={exitcode}")
+            verification_results['process_alive'] = False
+            return False
+        else:
+            verification_results['process_alive'] = True
+        
+        # 2. 检查是否有新输出
+        with process_lock:
+            if task_id in active_processes:
+                last_activity = active_processes[task_id].get('last_activity_time')
+                if last_activity:
+                    seconds_since_activity = (datetime.now(beijing_tz) - last_activity).total_seconds()
+                    if seconds_since_activity < 5:  # 5秒内有活动
+                        verification_results['has_output'] = True
+        
+        # 3. 检查网络状态
+        with process_lock:
+            if task_id in active_processes:
+                rtmp_url = active_processes[task_id].get('rtmp_url')
+                if rtmp_url:
+                    from app.utils.network_utils import extract_host_from_rtmp
+                    host = extract_host_from_rtmp(rtmp_url)
+                    
+                    # 执行ping测试
+                    try:
+                        result = subprocess.run(['ping', '-c', '2', host], 
+                                           capture_output=True, text=True, timeout=3)
+                        if result.returncode == 0:
+                            loss_match = re.search(r'(\d+)% packet loss', result.stdout)
+                            if loss_match and int(loss_match.group(1)) < 20:
+                                verification_results['network_stable'] = True
+                    except Exception as e:
+                        task_logger.warning(f"网络检测失败: {str(e)}")
+        
+        # 4. 检查关键错误
+        try:
+            stderr_output = new_process.stderr.readline()
+            if stderr_output:
+                captured_output.append(stderr_output.strip())
+                
+                # 检测严重错误
+                error_keywords = ['Error', 'Failed', 'Cannot', 'Unable', 'Invalid']
+                if any(keyword.lower() in stderr_output.lower() for keyword in error_keywords):
+                    error_count += 1
+                    critical_errors.append(stderr_output.strip())
+                    
+                # 如果有过多错误，标记验证失败
+                if error_count >= 3:
+                    verification_results['no_critical_errors'] = False
+                    task_logger.error(f"验证失败: 检测到多个错误, 最后错误: {stderr_output.strip()}")
+        except Exception:
+            pass
+            
+        # 每次循环睡眠一段时间
+        time.sleep(2)
+    
+    # 验证结束，分析结果
+    passed_checks = sum(1 for result in verification_results.values() if result)
+    total_checks = len(verification_results)
+    
+    # 记录详细的验证结果
+    task_logger.info(f"重连验证结果:")
+    task_logger.info(f"- 进程存活: {'是' if verification_results['process_alive'] else '否'}")
+    task_logger.info(f"- 有输出产生: {'是' if verification_results['has_output'] else '否'}")
+    task_logger.info(f"- 网络稳定: {'是' if verification_results['network_stable'] else '否'}")
+    task_logger.info(f"- 无严重错误: {'是' if verification_results['no_critical_errors'] else '否'}")
+    
+    if passed_checks < total_checks - 1:  # 允许一项检查失败
+        task_logger.warning(f"重连验证未完全通过: {passed_checks}/{total_checks} 项检查通过")
+        if critical_errors:
+            task_logger.error(f"验证期间的关键错误: {critical_errors}")
+        return False
+    
+    task_logger.info(f"重连验证通过: {passed_checks}/{total_checks} 项检查通过")
+    
+    # 最后检查流媒体状态
+    try:
+        if captured_output:
+            # 分析捕获的输出，查找关键信息
+            fps_pattern = re.compile(r'fps=\s*(\d+)')
+            speed_pattern = re.compile(r'speed=\s*([\d.]+)x')
+            
+            for line in captured_output[-10:]:  # 查看最后10行
+                fps_match = fps_pattern.search(line)
+                speed_match = speed_pattern.search(line)
+                
+                if fps_match:
+                    fps = int(fps_match.group(1))
+                    task_logger.info(f"检测到帧率: {fps} fps")
+                    
+                if speed_match:
+                    speed = float(speed_match.group(1))
+                    task_logger.info(f"检测到编码速度: {speed}x")
+                    
+                    # 如果编码速度过低，可能有问题
+                    if speed < 0.5:
+                        task_logger.warning(f"编码速度较低: {speed}x, 可能影响流媒体质量")
+    except Exception as e:
+        task_logger.warning(f"分析输出时出错: {str(e)}")
+    
+    # 所有检查通过，确认重连成功
+    return True
+
+def check_rtmp_connection_health(rtmp_url, timeout=3):
+    """
+    检查RTMP连接的健康状态，返回更详细的信息
+    
+    Args:
+        rtmp_url: RTMP URL
+        timeout: 超时时间（秒）
+        
+    Returns:
+        dict: 连接健康报告
+    """
+    health_report = {
+        'status': 'unknown',
+        'latency_ms': None,
+        'error_message': None,
+        'timestamp': datetime.now(beijing_tz)
+    }
+    
+    try:
+        # 提取主机信息
+        from app.utils.network_utils import extract_host_from_rtmp
+        host = extract_host_from_rtmp(rtmp_url)
+        
+        if not host:
+            health_report['status'] = 'error'
+            health_report['error_message'] = '无法从RTMP URL提取主机地址'
+            return health_report
+        
+        # 1. 先进行ping测试
+        ping_start = time.time()
+        ping_result = subprocess.run(['ping', '-c', '3', host], 
+                                  capture_output=True, text=True, timeout=timeout)
+        ping_duration = time.time() - ping_start
+        
+        # 处理ping结果
+        if ping_result.returncode == 0:
+            # 提取ping延迟
+            avg_match = re.search(r'min/avg/max/mdev = [\d.]+/([\d.]+)', ping_result.stdout)
+            if avg_match:
+                health_report['latency_ms'] = float(avg_match.group(1))
+            
+            # 提取丢包率
+            loss_match = re.search(r'(\d+)% packet loss', ping_result.stdout)
+            if loss_match:
+                packet_loss = int(loss_match.group(1))
+                health_report['packet_loss'] = packet_loss
+                
+                # 根据丢包率判断状态
+                if packet_loss == 0:
+                    health_report['status'] = 'excellent'
+                elif packet_loss < 5:
+                    health_report['status'] = 'good'
+                elif packet_loss < 20:
+                    health_report['status'] = 'fair'
+                else:
+                    health_report['status'] = 'poor'
+            else:
+                health_report['status'] = 'unknown'
+        else:
+            health_report['status'] = 'error'
+            health_report['error_message'] = 'Ping测试失败'
+        
+        # 2. 尝试TCP连接测试
+        try:
+            import socket
+            port = 1935  # RTMP默认端口
+            
+            tcp_start = time.time()
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            s.connect((host, port))
+            tcp_duration = time.time() - tcp_start
+            s.close()
+            
+            health_report['tcp_connect_time'] = tcp_duration * 1000  # 转换为毫秒
+            
+            # 如果TCP连接成功，状态至少是fair
+            if health_report['status'] in ['error', 'unknown', 'poor']:
+                health_report['status'] = 'fair'
+                
+        except Exception as e:
+            health_report['tcp_error'] = str(e)
+            
+            # 如果TCP连接失败，状态降为error
+            health_report['status'] = 'error'
+            health_report['error_message'] = f'TCP连接失败: {str(e)}'
+        
+        return health_report
+    
+    except Exception as e:
+        health_report['status'] = 'error'
+        health_report['error_message'] = f'检查连接健康时出错: {str(e)}'
+        return health_report
+
+def is_network_recovered(line):
+    """
+    判断一行输出是否表示网络已恢复
+    
+    Args:
+        line: FFmpeg的一行输出
+        
+    Returns:
+        bool: 是否表示网络已恢复
+    """
+    line = line.lower()
+    
+    # 成功发送数据的标志
+    if 'speed=' in line and 'fps=' in line and 'frame=' in line:
+        return True
+        
+    # RTMP连接成功的标志  
+    if 'rtmp: connected' in line or 'connection successfully established' in line:
+        return True
+        
+    # 成功打开输出的标志
+    if 'output stream opened' in line:
+        return True
+        
+    # 其他可能表示恢复的信息
+    recovery_indicators = [
+        'resuming',
+        'reconnect successful',
+        'connection restored'
+    ]
+    
+    for indicator in recovery_indicators:
+        if indicator in line:
+            return True
+            
+    return False
+
+def reset_task_network_status(task_id):
+    """
+    重置任务的网络状态相关参数
+    
+    Args:
+        task_id: 任务ID
+    """
+    logger.info(f'重置任务 {task_id} 网络状态')
+    
+    with process_lock:
+        if task_id in active_processes:
+            # 重置网络监控相关状态
+            active_processes[task_id]['network_issue_start_time'] = None
+            active_processes[task_id]['in_buffer_period'] = False
+            active_processes[task_id]['buffer_period_start'] = None
+            active_processes[task_id]['previous_network_status'] = 'normal'
+            active_processes[task_id]['network_recovered'] = False
+            active_processes[task_id]['network_status'] = '正常'
 
 # 其他函数保持不变... 

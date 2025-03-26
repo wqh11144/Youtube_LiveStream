@@ -223,6 +223,22 @@ def monitor_all_rtmp_connections():
                         del active_processes[task_id]
                         continue
                 
+                # 检查是否正在验证重连或已在缓冲期内
+                if info.get('verifying_reconnection', False) or info.get('in_buffer_period', False):
+                    continue  # 跳过验证中的任务，避免干扰
+                    
+                # 如果任务已经在缓冲期内，则跳过网络监控触发的重连
+                if info.get('in_buffer_period', False):
+                    # 检查缓冲期是否刚开始(不到5秒)
+                    buffer_start = info.get('buffer_period_start')
+                    if buffer_start:
+                        now = datetime.now(beijing_tz)
+                        buffer_seconds = (now - buffer_start).total_seconds()
+                        # 如果缓冲期刚开始不久，完全跳过
+                        if buffer_seconds < 5:
+                            logger.info(f'任务 {task_id} 正在缓冲期初期({buffer_seconds:.1f}秒)，暂不进行网络监控')
+                            continue
+                
                 # 按照主机名分组任务
                 rtmp_url = info.get('rtmp_url', '')
                 host = extract_host_from_rtmp(rtmp_url)
@@ -270,19 +286,45 @@ def monitor_all_rtmp_connections():
                         
                         # 保存当前状态为之前状态，用于下次比较
                         active_processes[task_id]['previous_network_status'] = monitor_result.status
-            
-            # 对于严重网络问题，触发主动重连
-            if monitor_result.event_type == NETWORK_CRITICAL:
-                logger.warning(f'网络状态严重，触发主动重连 - host={host}, affected_tasks={monitor_result.affected_tasks}')
-                
-                # 为了避免冲突，对每个任务启动单独的线程来触发重连
-                for task_id in monitor_result.affected_tasks:
-                    # 使用线程执行重连，避免阻塞监控循环
-                    threading.Thread(
-                        target=trigger_reconnect,
-                        args=(task_id, f"监控检测到严重网络问题 - 丢包率:{monitor_result.packet_loss}%, 延迟:{monitor_result.ping_ms}ms"),
-                        daemon=True
-                    ).start()
+                        
+                        # 对于严重网络问题，添加缓冲期逻辑
+                        if monitor_result.event_type == NETWORK_CRITICAL:
+                            # 检查是否已经在缓冲期或正在重连
+                            if active_processes[task_id].get('in_buffer_period') or active_processes[task_id].get('reconnecting'):
+                                logger.info(f'任务 {task_id} 已在缓冲期或重连中，跳过网络监控触发')
+                                continue
+                                
+                            # 检查是否已经标记了网络问题开始时间
+                            if not active_processes[task_id].get('network_issue_start_time'):
+                                # 首次发现问题，记录开始时间
+                                active_processes[task_id]['network_issue_start_time'] = datetime.now(beijing_tz)
+                                logger.warning(f'任务 {task_id} 发现严重网络问题，开始缓冲期监控')
+                            else:
+                                # 已经在缓冲期，检查是否超过最大缓冲时间(10秒)
+                                issue_start = active_processes[task_id]['network_issue_start_time']
+                                now = datetime.now(beijing_tz)
+                                buffer_seconds = (now - issue_start).total_seconds()
+                                
+                                if buffer_seconds > 10:
+                                    # 超过缓冲期，问题仍存在，触发重连
+                                    logger.warning(f'任务 {task_id} 网络问题持续超过10秒 ({buffer_seconds:.1f}秒)，触发重连')
+                                    
+                                    # 重置问题计时器
+                                    active_processes[task_id]['network_issue_start_time'] = None
+                                    
+                                    # 使用线程执行重连，避免阻塞监控循环
+                                    threading.Thread(
+                                        target=trigger_reconnect,
+                                        args=(task_id, f"监控检测到持续10秒以上的严重网络问题 - 丢包率:{monitor_result.packet_loss}%, 延迟:{monitor_result.ping_ms}ms"),
+                                        daemon=True
+                                    ).start()
+                                else:
+                                    # 在缓冲期内，继续观察
+                                    logger.info(f'任务 {task_id} 网络问题仍在缓冲期内 ({buffer_seconds:.1f}秒/10秒)')
+                        elif active_processes[task_id].get('network_issue_start_time'):
+                            # 网络已恢复，清除问题开始时间
+                            logger.info(f'任务 {task_id} 网络问题已自行恢复，取消重连')
+                            active_processes[task_id]['network_issue_start_time'] = None
             
     except Exception as e:
         logger.error(f'全局网络质量监控失败: {str(e)}')
