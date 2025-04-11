@@ -37,7 +37,7 @@
                         </button>
                         <label class="btn btn-primary flex-grow-1 d-flex align-items-center justify-content-center" for="videoUpload">
                             <i class="bx bx-upload me-1"></i>上传
-                            <input type="file" id="videoUpload" accept="video/mp4,video/quicktime,video/x-msvideo,video/x-flv,.mp4,.mov,.avi,.flv" style="display: none;" onchange="uploadVideo(this)">
+                            <input type="file" id="videoUpload" accept="video/mp4,video/quicktime,video/x-msvideo,video/x-flv,.mp4,.mov,.avi,.flv" style="display: none;" onchange="uploadVideo(this)" multiple>
                         </label>
                         <button class="btn btn-danger flex-grow-1 d-flex align-items-center justify-content-center" onclick="clearVideos()">
                             <i class="bx bx-trash me-1"></i>清空
@@ -45,7 +45,7 @@
                     </div>
                 </div>
 
-                <div class="form-text" id="uploadSizeLimit">只支持视频编码: h264；支持的视频格式：mp4, flv</div>
+                <div class="form-text" id="uploadSizeLimit">只支持视频编码: h264；支持的视频格式：mp4, flv；可批量选择多个文件同时上传</div>
 
                 <!-- 文件上传进度条 -->
                 <div id="uploadProgressContainer" class="mt-3" style="display: none;">
