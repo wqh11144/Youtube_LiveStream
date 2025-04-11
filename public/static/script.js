@@ -1012,31 +1012,11 @@ async function uploadVideo(input) {
         return;
     }
 
-    const file = input.files[0];
+    const files = input.files;
+    const totalFiles = files.length;
+    let successCount = 0;
+    let failCount = 0;
     
-    // 验证文件类型
-    const validTypes = ['.mp4', '.mov', '.avi', '.flv'];
-    const fileExt = '.' + file.name.split('.').pop().toLowerCase();
-    if (!validTypes.includes(fileExt)) {
-        showToast('错误', `不支持的文件格式。支持的格式：${validTypes.join(', ')}`);
-        input.value = '';
-        return;
-    }
-    
-    // 验证文件大小
-    if (!maxFileSize) {
-        showToast('错误', '系统配置未加载，请刷新页面重试');
-        input.value = '';
-        return;
-    }
-    
-    const maxFileSizeBytes = maxFileSize * 1024 * 1024; // 转换为字节
-    if (file.size > maxFileSizeBytes) {
-        showToast('错误', `文件大小超过限制（最大${maxFileSize}MB）`);
-        input.value = '';
-        return;
-    }
-
     // 显示上传进度
     const progressBar = document.getElementById('uploadProgress');
     const progressContainer = document.getElementById('uploadProgressContainer');
@@ -1045,58 +1025,105 @@ async function uploadVideo(input) {
     progressBar.textContent = '0%';
 
     try {
-        const formData = new FormData();
-        formData.append('file', file);
-
-        await new Promise((resolve, reject) => {
-            const xhr = new XMLHttpRequest();
+        // 验证文件类型和大小
+        const validTypes = ['.mp4', '.mov', '.avi', '.flv'];
+        const maxFileSizeBytes = maxFileSize * 1024 * 1024; // 转换为字节
+        
+        if (!maxFileSize) {
+            showToast('错误', '系统配置未加载，请刷新页面重试');
+            input.value = '';
+            return;
+        }
+        
+        for (let i = 0; i < totalFiles; i++) {
+            const file = files[i];
             
-            xhr.upload.addEventListener('progress', (event) => {
-                if (event.lengthComputable) {
-                    const percentComplete = Math.round((event.loaded / event.total) * 100);
-                    progressBar.style.width = percentComplete + '%';
-                    progressBar.textContent = percentComplete + '%';
-                }
-            });
+            // 更新进度条显示当前处理的文件
+            progressBar.textContent = `处理文件 ${i+1}/${totalFiles}`;
+            
+            // 验证文件类型
+            const fileExt = '.' + file.name.split('.').pop().toLowerCase();
+            if (!validTypes.includes(fileExt)) {
+                failCount++;
+                console.warn(`文件 ${file.name} 格式不支持。支持的格式：${validTypes.join(', ')}`);
+                continue;
+            }
+            
+            // 验证文件大小
+            if (file.size > maxFileSizeBytes) {
+                failCount++;
+                console.warn(`文件 ${file.name} 大小超过限制（最大${maxFileSize}MB）`);
+                continue;
+            }
 
-            xhr.addEventListener('load', () => {
-                if (xhr.status === 200) {
-                    const result = JSON.parse(xhr.responseText);
-                    if (result.status === 'success') {
-                        showToast('成功', '文件上传成功');
-                        refreshVideoList();
-                        resolve(result);
-                    } else {
-                        reject(new Error(result.message || '上传失败'));
-                    }
-                } else {
-                    reject(new Error('上传失败'));
-                }
-                // 在上传完成后重置进度条
-                setTimeout(() => {
-                    progressContainer.style.display = 'none';
-                    progressBar.style.width = '0%';
-                    progressBar.textContent = '0%';
-                }, 1000);
-            });
+            try {
+                const formData = new FormData();
+                formData.append('file', file);
 
-            xhr.addEventListener('error', () => {
-                reject(new Error('上传失败'));
-                // 在上传失败后重置进度条
-                progressContainer.style.display = 'none';
-                progressBar.style.width = '0%';
-                progressBar.textContent = '0%';
-            });
+                await new Promise((resolve, reject) => {
+                    const xhr = new XMLHttpRequest();
+                    
+                    xhr.upload.addEventListener('progress', (event) => {
+                        if (event.lengthComputable) {
+                            const percentComplete = Math.round((event.loaded / event.total) * 100);
+                            progressBar.style.width = percentComplete + '%';
+                            progressBar.textContent = `${file.name}: ${percentComplete}%`;
+                        }
+                    });
 
-            xhr.open('POST', `${API_BASE_URL}/video/upload`);
-            xhr.send(formData);
-        });
+                    xhr.addEventListener('load', () => {
+                        if (xhr.status === 200) {
+                            const result = JSON.parse(xhr.responseText);
+                            if (result.status === 'success') {
+                                successCount++;
+                                resolve(result);
+                            } else {
+                                failCount++;
+                                reject(new Error(result.message || '上传失败'));
+                            }
+                        } else {
+                            failCount++;
+                            reject(new Error('上传失败'));
+                        }
+                    });
+
+                    xhr.addEventListener('error', () => {
+                        failCount++;
+                        reject(new Error('上传失败'));
+                    });
+
+                    xhr.open('POST', `${API_BASE_URL}/video/upload`);
+                    xhr.send(formData);
+                });
+            } catch (error) {
+                console.error(`上传文件 ${file.name} 失败:`, error);
+                failCount++;
+            }
+        }
+        
+        // 最终结果显示
+        if (successCount > 0) {
+            showToast('成功', `成功上传 ${successCount}/${totalFiles} 个文件`);
+            refreshVideoList();
+        }
+        
+        if (failCount > 0) {
+            showToast('警告', `${failCount}/${totalFiles} 个文件上传失败`);
+        }
+        
     } catch (error) {
         console.error('上传失败:', error);
         showToast('错误', '上传失败: ' + error.message);
     } finally {
         // 清空文件输入
         input.value = '';
+        
+        // 在上传完成后重置进度条
+        setTimeout(() => {
+            progressContainer.style.display = 'none';
+            progressBar.style.width = '0%';
+            progressBar.textContent = '0%';
+        }, 1000);
     }
 }
 
